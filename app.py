@@ -11,8 +11,7 @@ import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urljoin
 from urllib.robotparser import RobotFileParser
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+import http.client
 import ipaddress
 import json
 import re
@@ -587,39 +586,113 @@ def normalize_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def assert_public_host(base_url: str) -> None:
-    """Refuse hosts that resolve only to private, loopback, or link-local
-    addresses so /api/check cannot be used as an internal-network probe."""
-    host = urlparse(base_url).hostname or ''
+def resolve_public_ip(host: str) -> str:
+    """Resolve host and return one address, refusing the host outright if ANY
+    resolved address is private, loopback, link-local, or otherwise non-public.
+    The caller connects to the returned address directly (no second DNS lookup),
+    which closes the DNS-rebinding window between check and fetch."""
+    if not host:
+        raise ValueError("Missing hostname")
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
         raise RuntimeError(f"Could not resolve {host}: {e}")
+    ips = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
-            return
-    raise ValueError(f"{host} resolves to a private or local address; refusing to fetch it")
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_unspecified or ip.is_reserved):
+            raise ValueError(f"{host} resolves to a private or local address; refusing to fetch it")
+        ips.append(str(ip))
+    if not ips:
+        raise RuntimeError(f"Could not resolve {host}")
+    return ips[0]
+
+
+def assert_public_host(base_url: str) -> None:
+    """Refuse URLs whose host resolves to any private or local address."""
+    resolve_public_ip(urlparse(base_url).hostname or '')
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection that connects to a pre-validated IP while keeping the
+    original hostname for the Host header."""
+
+    def __init__(self, host, ip, **kwargs):
+        super().__init__(host, **kwargs)
+        self._pinned_ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to a pre-validated IP. SNI and certificate
+    validation still use the original hostname."""
+
+    def __init__(self, host, ip, context=None, **kwargs):
+        super().__init__(host, context=context, **kwargs)
+        self._pinned_ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+MAX_REDIRECTS = 3
+FETCH_TIMEOUT = 14
+MAX_BODY_BYTES = 512 * 1024
 
 
 def fetch_robots_txt(base_url: str) -> tuple[str, str]:
-    assert_public_host(base_url)
+    """Fetch <base_url>/robots.txt with SSRF-safe semantics: every hop
+    (including redirects) is resolved once, validated as public, and the TCP
+    connection is made to that exact validated address."""
     robots_url = urljoin(base_url.rstrip('/') + '/', 'robots.txt')
-    req = Request(robots_url, headers={
-        'User-Agent': 'Mozilla/5.0 (compatible; AIBotChecker/1.1; +https://execlayer.io)',
-        'Accept': 'text/plain,*/*',
-    })
+    url = robots_url
     ctx = ssl.create_default_context()
-    try:
-        with urlopen(req, timeout=14, context=ctx) as resp:
-            content = resp.read().decode('utf-8', errors='replace')
+
+    for _ in range(MAX_REDIRECTS + 1):
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            raise ValueError(f"Unsupported scheme in {url!r}")
+        host = parsed.hostname or ''
+        ip = resolve_public_ip(host)
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+        if parsed.scheme == 'https':
+            conn = _PinnedHTTPSConnection(host, ip, context=ctx, port=port, timeout=FETCH_TIMEOUT)
+        else:
+            conn = _PinnedHTTPConnection(host, ip, port=port, timeout=FETCH_TIMEOUT)
+
+        path = parsed.path or '/'
+        if parsed.query:
+            path += '?' + parsed.query
+        try:
+            conn.request('GET', path, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; AIBotChecker/1.1; +https://execlayer.io)',
+                'Accept': 'text/plain,*/*',
+            })
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.headers.get('Location')
+                resp.read(0)
+                if not location:
+                    raise RuntimeError(f"Redirect from {url} with no Location header")
+                url = urljoin(url, location)
+                continue
+            if resp.status in (404, 410):
+                return "", robots_url
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status} fetching {url}")
+            content = resp.read(MAX_BODY_BYTES).decode('utf-8', errors='replace')
             return content, robots_url
-    except HTTPError as e:
-        if e.code in (404, 410):
-            return "", robots_url
-        raise
-    except (URLError, socket.timeout, ssl.SSLError) as e:
-        raise RuntimeError(f"Could not reach {robots_url}: {e}")
+        except (OSError, http.client.HTTPException, ssl.SSLError) as e:
+            raise RuntimeError(f"Could not reach {url}: {e}")
+        finally:
+            conn.close()
+
+    raise RuntimeError(f"Too many redirects fetching {robots_url}")
 
 
 def build_recommendations(bots_result: list) -> list:

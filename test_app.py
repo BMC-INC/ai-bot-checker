@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Offline unit tests for the AI Bot Blocker Checker core. No network access."""
 
+import socket
 import unittest
+from unittest import mock
 
 from app import (
     AI_BOTS,
@@ -9,7 +11,12 @@ from app import (
     build_recommendations,
     evaluate_bots,
     normalize_url,
+    resolve_public_ip,
 )
+
+
+def _addrinfo(*ips):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, 0)) for ip in ips]
 
 BASE = "https://example.com"
 
@@ -89,6 +96,27 @@ class TestSsrfGuard(unittest.TestCase):
     def test_rejects_localhost_name(self):
         with self.assertRaises(ValueError):
             assert_public_host("https://localhost")
+
+    def test_rejects_missing_hostname(self):
+        with self.assertRaises(ValueError):
+            resolve_public_ip("")
+
+    def test_rejects_mixed_public_and_private_records(self):
+        # A host with even one private record must be refused entirely,
+        # otherwise a malicious DNS answer can smuggle a private target in.
+        with mock.patch("app.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34", "10.0.0.5")):
+            with self.assertRaises(ValueError):
+                resolve_public_ip("evil.example")
+
+    def test_returns_pinned_ip_for_public_host(self):
+        with mock.patch("app.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34")):
+            self.assertEqual(resolve_public_ip("example.com"), "93.184.216.34")
+
+    def test_rejects_metadata_endpoint_ip(self):
+        # 169.254.169.254 is link-local; the cloud metadata classic.
+        with mock.patch("app.socket.getaddrinfo", return_value=_addrinfo("169.254.169.254")):
+            with self.assertRaises(ValueError):
+                resolve_public_ip("metadata.internal")
 
 
 if __name__ == "__main__":
