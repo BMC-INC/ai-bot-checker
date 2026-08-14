@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-AI Bot Blocker Checker — Expanded 2026 edition
+AI Bot Blocker Checker, expanded 2026 edition.
 Checks robots.txt for dozens of AI crawlers and generates recommended allow rules.
+
+Run the web UI:      python3 app.py
+One-shot CLI check:  python3 app.py --check https://example.com
 """
 
+import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urljoin
 from urllib.robotparser import RobotFileParser
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+import ipaddress
 import json
 import re
 import ssl
 import socket
+import sys
 
 # Comprehensive AI crawler list (mid-2026)
 AI_BOTS = [
@@ -336,7 +342,7 @@ HTML = r'''<!DOCTYPE html>
   <div class="container">
     <header>
       <h1>AI Bot Blocker Checker</h1>
-      <p class="subtitle">Check which AI crawlers a site blocks — and get ready-to-use robots.txt recommendations</p>
+      <p class="subtitle">Check which AI crawlers a site blocks, and get ready-to-use robots.txt recommendations</p>
     </header>
 
     <div class="input-card">
@@ -362,7 +368,7 @@ HTML = r'''<!DOCTYPE html>
       <div id="insight" class="insight" style="display:none;"></div>
       <div id="bots"></div>
 
-      <div class="section-title">Recommendations — Make bots able to see the site</div>
+      <div class="section-title">Recommendations: control what AI bots can see</div>
       <div id="recommendations"></div>
 
       <div class="section-title">Raw robots.txt</div>
@@ -505,7 +511,7 @@ HTML = r'''<!DOCTYPE html>
       recEl.innerHTML = recHtml;
       window._recs = recs;
 
-      rawEl.textContent = data.raw || '(empty or missing robots.txt — treated as allow all by most crawlers)';
+      rawEl.textContent = data.raw || '(empty or missing robots.txt, treated as allow all by most crawlers)';
     }
 
     function escapeHtml(s) {
@@ -548,8 +554,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = check_site(url)
                 self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                self._json(502, {"error": str(e)})
             except Exception as e:
-                self._json(500, {"error": str(e)})
+                print(f"[error] /api/check {url!r}: {e}")
+                self._json(500, {"error": "Internal error while checking the site"})
             return
 
         self.send_response(404)
@@ -560,7 +571,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, indent=2).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -571,10 +582,28 @@ def normalize_url(url: str) -> str:
     if not re.match(r'^https?://', url, re.I):
         url = 'https://' + url
     parsed = urlparse(url)
+    if not parsed.netloc:
+        raise ValueError(f"Not a valid URL: {url!r}")
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def assert_public_host(base_url: str) -> None:
+    """Refuse hosts that resolve only to private, loopback, or link-local
+    addresses so /api/check cannot be used as an internal-network probe."""
+    host = urlparse(base_url).hostname or ''
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise RuntimeError(f"Could not resolve {host}: {e}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved):
+            return
+    raise ValueError(f"{host} resolves to a private or local address; refusing to fetch it")
+
+
 def fetch_robots_txt(base_url: str) -> tuple[str, str]:
+    assert_public_host(base_url)
     robots_url = urljoin(base_url.rstrip('/') + '/', 'robots.txt')
     req = Request(robots_url, headers={
         'User-Agent': 'Mozilla/5.0 (compatible; AIBotChecker/1.1; +https://execlayer.io)',
@@ -652,7 +681,7 @@ Allow: /
     balanced = """# Balanced 2026 posture: allow AI search & citations, restrict pure training scrapers
 # Search/retrieval bots stay open → better chance of being cited in ChatGPT, Claude, Perplexity, etc.
 
-# —— Allow search & user-triggered ——
+# Allow search & user-triggered fetchers
 User-agent: OAI-SearchBot
 Allow: /
 
@@ -680,7 +709,7 @@ Allow: /
 User-agent: MistralAI-User
 Allow: /
 
-# —— Restrict pure training (optional) ——
+# Restrict pure training crawlers (optional)
 User-agent: GPTBot
 Disallow: /
 
@@ -786,7 +815,7 @@ Allow: /
             "snippet": allow_all.strip()
         },
         {
-            "title": "2. Balanced — allow search/citations, block pure training",
+            "title": "2. Balanced: allow search/citations, block pure training",
             "description": "Popular publisher approach in 2026. Keeps you visible in AI answers while opting out of model-training crawls. Search bots stay open; training bots are disallowed.",
             "snippet": balanced.strip()
         },
@@ -798,14 +827,12 @@ Allow: /
     ]
 
 
-def check_site(user_url: str) -> dict:
-    base = normalize_url(user_url)
-    content, robots_url = fetch_robots_txt(base)
-
+def evaluate_bots(robots_content: str, base_url: str) -> list:
+    """Pure evaluation of a robots.txt body against the AI crawler list.
+    No network access, so it is directly unit-testable."""
     rp = RobotFileParser()
-    rp.parse(content.splitlines())
-
-    test_path = base.rstrip('/') + '/'
+    rp.parse(robots_content.splitlines())
+    test_path = base_url.rstrip('/') + '/'
 
     bots_result = []
     for bot in AI_BOTS:
@@ -822,6 +849,13 @@ def check_site(user_url: str) -> dict:
             "desc": bot["desc"],
             "status": status,
         })
+    return bots_result
+
+
+def check_site(user_url: str) -> dict:
+    base = normalize_url(user_url)
+    content, robots_url = fetch_robots_txt(base)
+    bots_result = evaluate_bots(content, base)
 
     return {
         "url": base,
@@ -834,14 +868,28 @@ def check_site(user_url: str) -> dict:
 
 
 def main():
-    server = HTTPServer(('0.0.0.0', PORT), Handler)
-    print(f"AI Bot Blocker Checker running at http://localhost:{PORT}")
+    parser = argparse.ArgumentParser(description="Check which AI crawlers a site blocks via robots.txt")
+    parser.add_argument('--host', default='127.0.0.1', help="Bind address for the web UI (default: 127.0.0.1)")
+    parser.add_argument('--port', type=int, default=PORT, help=f"Port for the web UI (default: {PORT})")
+    parser.add_argument('--check', metavar='URL', help="One-shot CLI mode: check URL, print JSON, exit")
+    args = parser.parse_args()
+
+    if args.check:
+        try:
+            print(json.dumps(check_site(args.check), indent=2))
+        except (ValueError, RuntimeError) as e:
+            print(json.dumps({"error": str(e)}), file=sys.stderr)
+            sys.exit(1)
+        return
+
+    server = HTTPServer((args.host, args.port), Handler)
+    print(f"AI Bot Blocker Checker running at http://{args.host}:{args.port}")
     print(f"Checking {len(AI_BOTS)} AI crawlers")
     print("Press Ctrl+C to stop")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\\nShutting down")
+        print("\nShutting down")
         server.server_close()
 
 
