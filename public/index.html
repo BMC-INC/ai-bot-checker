@@ -243,6 +243,52 @@
       margin-bottom: 1.25rem;
     }
     .insight strong { color: #c4b5fd; }
+    .insight.selective, .insight.visibility_risk {
+      background: rgba(255, 176, 32, 0.08);
+      border-color: rgba(255, 176, 32, 0.35);
+    }
+    .insight.selective strong, .insight.visibility_risk strong { color: #ffcf7d; }
+    .audience-toggle {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      font-size: 0.88rem;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+    .audience-toggle button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: inherit;
+      font: inherit;
+      padding: 0.35rem 0.9rem;
+      cursor: pointer;
+    }
+    .audience-toggle button.active {
+      border-color: #7c5cff;
+      color: #c4b5fd;
+      background: rgba(124, 92, 255, 0.12);
+    }
+    .rec-card.recommended { border-color: #7c5cff; }
+    .rec-card.dimmed { opacity: 0.55; }
+    .rec-badge {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #c4b5fd;
+      background: rgba(124, 92, 255, 0.15);
+      border-radius: 999px;
+      padding: 0.15rem 0.6rem;
+      margin-left: 0.5rem;
+      vertical-align: middle;
+    }
+    .unscored-note {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 0.75rem;
+    }
     footer {
       text-align: center;
       margin-top: 3rem;
@@ -296,9 +342,15 @@
       <div id="bots"></div>
 
       <div class="section-title">Recommendations: control what AI bots can see</div>
+      <div class="audience-toggle" id="audienceToggle">
+        <span>What is this site?</span>
+        <button type="button" data-audience="vendor">Product / company site</button>
+        <button type="button" data-audience="publisher">Content is the product</button>
+      </div>
       <div id="recommendations"></div>
 
       <div class="section-title">Raw robots.txt</div>
+      <div class="unscored-note" id="unscored" style="display:none;"></div>
       <div class="raw-box" id="raw"></div>
       <div class="note">
         <strong>Note:</strong> This only inspects <code>robots.txt</code>. Cloudflare / WAF / Bot Fight Mode rules can still block AI traffic even when robots.txt allows it. User-triggered fetchers (ChatGPT-User, Claude-User, Perplexity-User) frequently ignore robots.txt by design. For stronger control consider Content-Signal directives and an <code>llms.txt</code> file.
@@ -381,19 +433,13 @@
         <div class="stat"><div class="stat-value">${data.bots.length}</div><div class="stat-label">Total checked</div></div>
       `;
 
-      const searchBlocked = data.bots.filter(b => b.category === 'Search' && b.status === 'blocked');
-      const trainingBlocked = data.bots.filter(b => b.category === 'Training' && b.status === 'blocked');
-      let insightText = '';
-      if (searchBlocked.length >= 3) {
-        insightText = `<strong>Visibility risk:</strong> ${searchBlocked.length} search/retrieval bots are blocked (including ${searchBlocked.slice(0,3).map(b=>b.name).join(', ')}). This can remove the site from ChatGPT Search, Perplexity, Claude search results, and similar citation surfaces.`;
-      } else if (blocked === 0) {
-        insightText = `<strong>Fully open:</strong> No AI crawlers are blocked by robots.txt. The site is available for both training and AI search/citation.`;
-      } else if (trainingBlocked.length > 0 && searchBlocked.length === 0) {
-        insightText = `<strong>Balanced posture:</strong> Training bots are restricted while search/retrieval bots remain allowed. This is a common modern configuration for publishers who want citations without full training access.`;
-      } else {
-        insightText = `<strong>Mixed rules:</strong> Some AI bots are blocked. Review the categories below and use the recommendations to fine-tune.`;
-      }
-      insightEl.innerHTML = insightText;
+      // The verdict is computed server-side from the same per-bot results as
+      // the grid below, so the two can never disagree.
+      const posture = data.posture;
+      insightEl.className = 'insight' + (posture ? ' ' + posture.verdict : '');
+      insightEl.innerHTML = posture
+        ? `<strong>${escapeHtml(posture.label)}:</strong> ${escapeHtml(posture.detail)}`
+        : `<strong>Mixed rules:</strong> Some AI bots are blocked. Review the categories below.`;
       insightEl.style.display = 'block';
 
       const cats = {};
@@ -426,8 +472,8 @@
       let recHtml = '';
       recs.forEach((r, idx) => {
         recHtml += `
-          <div class="rec-card">
-            <h3>${r.title}</h3>
+          <div class="rec-card" data-audience="${r.audience || ''}">
+            <h3>${r.title}<span class="rec-badge" style="display:none;">Recommended for you</span></h3>
             <p>${r.description}</p>
             <div class="rec-actions">
               <button class="btn-secondary" onclick="copyRec(${idx})">Copy robots.txt snippet</button>
@@ -437,12 +483,46 @@
       });
       recEl.innerHTML = recHtml;
       window._recs = recs;
+      applyAudience(selectedAudience);
+
+      const unscored = data.unscored_agents || [];
+      const unscoredEl = document.getElementById('unscored');
+      if (unscored.length) {
+        const shown = unscored.slice(0, 15);
+        const more = unscored.length - shown.length;
+        unscoredEl.textContent = 'This robots.txt also has rules for user-agents not scored in the grid above: '
+          + shown.join(', ') + (more > 0 ? ` (+${more} more)` : '') + '.';
+        unscoredEl.style.display = 'block';
+      } else {
+        unscoredEl.style.display = 'none';
+      }
 
       rawEl.textContent = data.raw || '(empty or missing robots.txt, treated as allow all by most crawlers)';
     }
 
     function escapeHtml(s) {
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    let selectedAudience = null;
+    const audienceToggle = document.getElementById('audienceToggle');
+    audienceToggle.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-audience]');
+      if (!btn) return;
+      selectedAudience = btn.dataset.audience === selectedAudience ? null : btn.dataset.audience;
+      applyAudience(selectedAudience);
+    });
+
+    function applyAudience(audience) {
+      audienceToggle.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b.dataset.audience === audience);
+      });
+      document.querySelectorAll('#recommendations .rec-card').forEach(card => {
+        const match = audience && card.dataset.audience === audience;
+        card.classList.toggle('recommended', match);
+        card.classList.toggle('dimmed', !!audience && !match);
+        card.querySelector('.rec-badge').style.display = match ? 'inline-block' : 'none';
+      });
     }
 
     function copyRec(idx) {

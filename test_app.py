@@ -9,7 +9,9 @@ from app import (
     AI_BOTS,
     assert_public_host,
     build_recommendations,
+    compute_posture,
     evaluate_bots,
+    find_unscored_agents,
     normalize_url,
     resolve_public_ip,
 )
@@ -57,6 +59,77 @@ class TestEvaluateBots(unittest.TestCase):
         bot = evaluate_bots("", BASE)[0]
         for key in ("ua", "name", "operator", "category", "desc", "status"):
             self.assertIn(key, bot)
+
+
+def _block(*uas):
+    """robots.txt that blocks exactly the given user-agents."""
+    return "\n".join(f"User-agent: {ua}\nDisallow: /\n" for ua in uas)
+
+
+def _training_uas():
+    return [b["ua"] for b in AI_BOTS if b["category"] == "Training"]
+
+
+class TestComputePosture(unittest.TestCase):
+    def _posture(self, robots):
+        return compute_posture(evaluate_bots(robots, BASE))
+
+    def test_shape(self):
+        p = self._posture("")
+        for key in ("verdict", "label", "detail"):
+            self.assertIn(key, p)
+
+    def test_open_when_nothing_blocked(self):
+        self.assertEqual(self._posture("")["verdict"], "open")
+
+    def test_locked_down_when_everything_blocked(self):
+        self.assertEqual(self._posture("User-agent: *\nDisallow: /\n")["verdict"], "locked_down")
+
+    def test_balanced_requires_all_training_bots_blocked(self):
+        p = self._posture(_block(*_training_uas()))
+        self.assertEqual(p["verdict"], "balanced")
+
+    def test_partial_training_block_is_selective_not_balanced(self):
+        # The execlayer.io case: 5 of 12 training bots blocked must NOT
+        # be reported as "balanced" — it's an incomplete blocklist.
+        p = self._posture(_block("GPTBot", "Google-Extended", "Bytespider", "CCBot", "FacebookBot"))
+        self.assertEqual(p["verdict"], "selective")
+
+    def test_selective_detail_names_blocked_and_allowed_operators(self):
+        p = self._posture(_block("GPTBot", "Google-Extended"))
+        self.assertIn("OpenAI", p["detail"])
+        self.assertIn("Anthropic", p["detail"])
+
+    def test_visibility_risk_when_search_bots_blocked(self):
+        p = self._posture(_block("OAI-SearchBot", "PerplexityBot", "Claude-SearchBot", "Applebot"))
+        self.assertEqual(p["verdict"], "visibility_risk")
+
+
+class TestFindUnscoredAgents(unittest.TestCase):
+    def test_flags_agents_the_grid_does_not_score(self):
+        robots = "User-agent: Bingbot\nDisallow: /\n\nUser-agent: GPTBot\nDisallow: /\n"
+        self.assertEqual(find_unscored_agents(robots), ["Bingbot"])
+
+    def test_case_insensitive_match_against_scored_list(self):
+        # Claude-Web is scored as "claude-web"; must not be flagged.
+        robots = "User-agent: Claude-Web\nDisallow: /\n"
+        self.assertEqual(find_unscored_agents(robots), [])
+
+    def test_ignores_wildcard_and_dedupes(self):
+        robots = "User-agent: *\nAllow: /\n\nUser-agent: Bingbot\nUser-agent: bingbot\nDisallow: /\n"
+        self.assertEqual(find_unscored_agents(robots), ["Bingbot"])
+
+    def test_empty_robots(self):
+        self.assertEqual(find_unscored_agents(""), [])
+
+
+class TestRecommendationAudience(unittest.TestCase):
+    def test_every_recommendation_declares_an_audience(self):
+        recs = build_recommendations(evaluate_bots("", BASE))
+        self.assertTrue(recs)
+        for r in recs:
+            self.assertIn("audience", r)
+            self.assertIn(r["audience"], ("vendor", "publisher", "strict"))
 
 
 class TestBotList(unittest.TestCase):

@@ -36,7 +36,7 @@ AI_BOTS = [
     
     # Google
     {"ua": "Google-Extended", "name": "Google-Extended", "operator": "Google", "category": "Training", "desc": "Gemini / AI training & grounding control (not Search ranking)"},
-    {"ua": "GoogleOther", "name": "GoogleOther", "operator": "Google", "category": "Training", "desc": "Google research / AI-related crawling"},
+    {"ua": "GoogleOther", "name": "GoogleOther", "operator": "Google", "category": "Training", "desc": "Google's general R&D crawler (not solely AI training — blocking it is not a clean training opt-out; Google-Extended is)"},
     {"ua": "Google-CloudVertexBot", "name": "Google-CloudVertexBot", "operator": "Google", "category": "Search", "desc": "Vertex AI / Cloud AI platform crawler"},
     
     # Perplexity
@@ -394,6 +394,9 @@ Disallow: /
 User-agent: Google-Extended
 Disallow: /
 
+# Note: GoogleOther is Google's general R&D crawler, not purely AI training.
+# Blocking it is not a clean training opt-out (Google-Extended is) and may
+# affect other Google product functions.
 User-agent: GoogleOther
 Disallow: /
 
@@ -431,20 +434,104 @@ Allow: /
     return [
         {
             "title": "1. Allow all major AI bots (recommended for visibility)",
-            "description": "Best default if you want your content cited in ChatGPT, Claude, Perplexity, Gemini answers, etc. Explicit Allow rules make intent clear.",
+            "description": "Best default if your content markets a product or company (B2B, SaaS, portfolios): being cited in ChatGPT, Claude, Perplexity and Gemini answers is free distribution. Explicit Allow rules make intent clear.",
+            "audience": "vendor",
             "snippet": allow_all.strip()
         },
         {
             "title": "2. Balanced: allow search/citations, block pure training",
-            "description": "Popular publisher approach in 2026. Keeps you visible in AI answers while opting out of model-training crawls. Search bots stay open; training bots are disallowed.",
+            "description": "For publishers whose content IS the product (news, original reporting, paid content). Keeps you visible in AI answers while opting out of model-training crawls. If your site is marketing for something else you sell, this template costs you reach for little benefit.",
+            "audience": "publisher",
             "snippet": balanced.strip()
         },
         {
             "title": "3. Block everything AI-related",
             "description": "Use only if you want zero AI use of your content. This will also hide the site from AI search features and most citation surfaces.",
+            "audience": "strict",
             "snippet": block_all.strip()
         },
     ]
+
+
+def compute_posture(bots_result: list) -> dict:
+    """Derive the headline verdict from the per-bot results so the summary can
+    never contradict the grid below it."""
+    blocked = [b for b in bots_result if b["status"] == "blocked"]
+    search = [b for b in bots_result if b["category"] == "Search"]
+    training = [b for b in bots_result if b["category"] == "Training"]
+    s_blocked = [b for b in search if b["status"] == "blocked"]
+    t_blocked = [b for b in training if b["status"] == "blocked"]
+    t_allowed = [b for b in training if b["status"] == "allowed"]
+
+    def operators(bots):
+        return sorted({b["operator"] for b in bots})
+
+    if not blocked:
+        return {
+            "verdict": "open",
+            "label": "Fully open",
+            "detail": "No AI crawlers are blocked by robots.txt. The site is available for both training and AI search/citation.",
+        }
+    if len(blocked) == len(bots_result):
+        return {
+            "verdict": "locked_down",
+            "label": "Locked down",
+            "detail": "Every AI crawler checked is blocked. The site will not appear in AI search results or citations, and its content is opted out of training.",
+        }
+    if len(s_blocked) >= 3 or (search and len(s_blocked) * 2 >= len(search)):
+        names = ", ".join(b["name"] for b in s_blocked[:3])
+        return {
+            "verdict": "visibility_risk",
+            "label": "Visibility risk",
+            "detail": f"{len(s_blocked)} of {len(search)} search/retrieval bots are blocked (including {names}). This can remove the site from ChatGPT Search, Perplexity, Claude search results, and similar citation surfaces.",
+        }
+    if t_blocked and t_allowed:
+        blocked_ops = operators(t_blocked)
+        allowed_ops = [op for op in operators(t_allowed) if op not in blocked_ops]
+        allowed_phrase = ", ".join(allowed_ops) if allowed_ops else "other crawlers from those same operators"
+        return {
+            "verdict": "selective",
+            "label": "Selective training block — likely unintentional",
+            "detail": (
+                f"Blocks training crawlers from {', '.join(blocked_ops)} "
+                f"but still allows {allowed_phrase} "
+                f"({len(t_blocked)} of {len(training)} training bots blocked). "
+                "This usually means a partially copied blocklist rather than a deliberate policy — "
+                "use the Balanced template below to close the gaps, or the Allow-all template if training access is fine."
+            ),
+        }
+    if training and not t_allowed and not s_blocked:
+        return {
+            "verdict": "balanced",
+            "label": "Balanced posture",
+            "detail": f"All {len(training)} training bots are blocked while search/retrieval bots remain allowed. This is a common configuration for publishers who want citations without training access.",
+        }
+    return {
+        "verdict": "mixed",
+        "label": "Mixed rules",
+        "detail": "Some AI bots are blocked in a pattern that doesn't match a common posture. Review the categories below and use the recommendations to fine-tune.",
+    }
+
+
+def find_unscored_agents(robots_content: str) -> list:
+    """User-agents named in robots.txt that the bot grid does not score, so the
+    report can say 'these rules exist but are not reflected above'."""
+    scored = {b["ua"].lower() for b in AI_BOTS}
+    seen, unscored = set(), []
+    for line in robots_content.splitlines():
+        line = line.split('#', 1)[0].strip()
+        if ':' not in line:
+            continue
+        field, _, value = line.partition(':')
+        if field.strip().lower() != 'user-agent':
+            continue
+        agent = value.strip()
+        key = agent.lower()
+        if not agent or agent == '*' or key in scored or key in seen:
+            continue
+        seen.add(key)
+        unscored.append(agent)
+    return unscored
 
 
 def evaluate_bots(robots_content: str, base_url: str) -> list:
@@ -483,6 +570,8 @@ def check_site(user_url: str) -> dict:
         "raw": content[:12000] if content else "",
         "bots": bots_result,
         "has_robots": bool(content.strip()),
+        "posture": compute_posture(bots_result),
+        "unscored_agents": find_unscored_agents(content),
         "recommendations": build_recommendations(bots_result),
     }
 
