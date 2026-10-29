@@ -11,6 +11,8 @@ from app import (
     build_recommendations,
     compute_posture,
     evaluate_bots,
+    fetch_robots_txt,
+    MAX_BODY_BYTES,
     find_unscored_agents,
     normalize_url,
     resolve_public_ip,
@@ -134,7 +136,7 @@ class TestRecommendationAudience(unittest.TestCase):
 
 class TestBotList(unittest.TestCase):
     def test_no_duplicate_user_agents(self):
-        uas = [b["ua"] for b in AI_BOTS]
+        uas = [b["ua"].lower() for b in AI_BOTS]
         self.assertEqual(len(uas), len(set(uas)))
 
     def test_categories_are_known(self):
@@ -155,6 +157,33 @@ class TestRecommendations(unittest.TestCase):
         balanced = build_recommendations([])[1]["snippet"]
         self.assertIn("User-agent: OAI-SearchBot\nAllow: /", balanced)
         self.assertIn("User-agent: GPTBot\nDisallow: /", balanced)
+
+
+    def test_templates_match_their_reported_postures(self):
+        recommendations = build_recommendations([])
+        for recommendation, expected in zip(recommendations, ("open", "balanced", "locked_down")):
+            with self.subTest(expected=expected):
+                results = evaluate_bots(recommendation["snippet"], BASE)
+                self.assertEqual(compute_posture(results)["verdict"], expected)
+                self.assertEqual(len(results), len(AI_BOTS))
+                self.assertNotIn("User-agent: *", recommendation["snippet"])
+
+    def test_block_template_covers_every_catalog_token(self):
+        results = evaluate_bots(build_recommendations([])[2]["snippet"], BASE)
+        self.assertTrue(all(bot["status"] == "blocked" for bot in results))
+
+
+class TestFetchLimits(unittest.TestCase):
+    @mock.patch("app.resolve_public_ip", return_value="93.184.216.34")
+    @mock.patch("app._PinnedHTTPSConnection")
+    def test_oversized_robots_is_an_error_not_a_partial_verdict(self, connection, _resolve):
+        response = connection.return_value.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b" " * (MAX_BODY_BYTES + 1)
+        with self.assertRaisesRegex(RuntimeError, "inspection limit"):
+            fetch_robots_txt(BASE)
+        connection.return_value.close.assert_called_once()
+
 
 
 class TestSsrfGuard(unittest.TestCase):
@@ -184,6 +213,11 @@ class TestSsrfGuard(unittest.TestCase):
     def test_returns_pinned_ip_for_public_host(self):
         with mock.patch("app.socket.getaddrinfo", return_value=_addrinfo("93.184.216.34")):
             self.assertEqual(resolve_public_ip("example.com"), "93.184.216.34")
+
+    def test_rejects_shared_address_space(self):
+        with mock.patch("app.socket.getaddrinfo", return_value=_addrinfo("100.64.0.1")):
+            with self.assertRaises(ValueError):
+                resolve_public_ip("shared.example")
 
     def test_rejects_metadata_endpoint_ip(self):
         # 169.254.169.254 is link-local; the cloud metadata classic.

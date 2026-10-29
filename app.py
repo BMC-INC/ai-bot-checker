@@ -45,7 +45,6 @@ AI_BOTS = [
     
     # Meta
     {"ua": "Meta-ExternalAgent", "name": "Meta-ExternalAgent", "operator": "Meta", "category": "Training", "desc": "Meta AI / Llama training collection"},
-    {"ua": "meta-externalagent", "name": "meta-externalagent", "operator": "Meta", "category": "Training", "desc": "Lowercase variant of Meta-ExternalAgent"},
     {"ua": "Meta-ExternalFetcher", "name": "Meta-ExternalFetcher", "operator": "Meta", "category": "User Fetch", "desc": "Meta AI user-triggered fetcher"},
     {"ua": "FacebookBot", "name": "FacebookBot", "operator": "Meta", "category": "Training", "desc": "Facebook / Meta AI related crawler"},
     
@@ -64,7 +63,6 @@ AI_BOTS = [
     {"ua": "MistralAI-User", "name": "MistralAI-User", "operator": "Mistral", "category": "User Fetch", "desc": "Mistral Le Chat live fetches"},
     {"ua": "PhindBot", "name": "PhindBot", "operator": "Phind", "category": "Search", "desc": "Phind developer-focused AI search"},
     {"ua": "AI2Bot", "name": "AI2Bot", "operator": "Allen Institute", "category": "Training", "desc": "Allen AI research / Semantic Scholar"},
-    {"ua": "ai2bot", "name": "ai2bot", "operator": "Allen Institute", "category": "Training", "desc": "Lowercase AI2Bot variant"},
     {"ua": "omgili", "name": "omgili", "operator": "Webz.io", "category": "Training", "desc": "Webz.io data mining crawler"},
     {"ua": "Omgilibot", "name": "Omgilibot", "operator": "Webz.io", "category": "Training", "desc": "Webz.io variant"},
 ]
@@ -147,7 +145,7 @@ def resolve_public_ip(host: str) -> str:
     ips = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
+        if (not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_multicast or ip.is_unspecified or ip.is_reserved):
             raise ValueError(f"{host} resolves to a private or local address; refusing to fetch it")
         ips.append(str(ip))
@@ -232,7 +230,10 @@ def fetch_robots_txt(base_url: str) -> tuple[str, str]:
                 return "", robots_url
             if resp.status >= 400:
                 raise RuntimeError(f"HTTP {resp.status} fetching {url}")
-            content = resp.read(MAX_BODY_BYTES).decode('utf-8', errors='replace')
+            body = resp.read(MAX_BODY_BYTES + 1)
+            if len(body) > MAX_BODY_BYTES:
+                raise RuntimeError("robots.txt exceeds the 512 KiB inspection limit")
+            content = body.decode('utf-8', errors='replace')
             return content, robots_url
         except (OSError, http.client.HTTPException, ssl.SSLError) as e:
             raise RuntimeError(f"Could not reach {url}: {e}")
@@ -243,212 +244,38 @@ def fetch_robots_txt(base_url: str) -> tuple[str, str]:
 
 
 def build_recommendations(bots_result: list) -> list:
-    allow_all = """# Allow all major AI crawlers (maximum visibility / citations)
-# Add these rules or remove any Disallow lines for these user-agents.
-
-User-agent: GPTBot
-Allow: /
-
-User-agent: OAI-SearchBot
-Allow: /
-
-User-agent: ChatGPT-User
-Allow: /
-
-User-agent: ClaudeBot
-Allow: /
-
-User-agent: Claude-SearchBot
-Allow: /
-
-User-agent: Claude-User
-Allow: /
-
-User-agent: anthropic-ai
-Allow: /
-
-User-agent: PerplexityBot
-Allow: /
-
-User-agent: Perplexity-User
-Allow: /
-
-User-agent: Google-Extended
-Allow: /
-
-User-agent: GoogleOther
-Allow: /
-
-User-agent: Meta-ExternalAgent
-Allow: /
-
-User-agent: Applebot-Extended
-Allow: /
-
-User-agent: Amazonbot
-Allow: /
-
-User-agent: YouBot
-Allow: /
-
-User-agent: DuckAssistBot
-Allow: /
-
-User-agent: *
-Allow: /
-"""
-
-    balanced = """# Balanced 2026 posture: allow AI search & citations, restrict pure training scrapers
-# Search/retrieval bots stay open → better chance of being cited in ChatGPT, Claude, Perplexity, etc.
-
-# Allow search & user-triggered fetchers
-User-agent: OAI-SearchBot
-Allow: /
-
-User-agent: ChatGPT-User
-Allow: /
-
-User-agent: Claude-SearchBot
-Allow: /
-
-User-agent: Claude-User
-Allow: /
-
-User-agent: PerplexityBot
-Allow: /
-
-User-agent: Perplexity-User
-Allow: /
-
-User-agent: YouBot
-Allow: /
-
-User-agent: DuckAssistBot
-Allow: /
-
-User-agent: MistralAI-User
-Allow: /
-
-# Restrict pure training crawlers (optional)
-User-agent: GPTBot
-Disallow: /
-
-User-agent: ClaudeBot
-Disallow: /
-
-User-agent: Google-Extended
-Disallow: /
-
-User-agent: CCBot
-Disallow: /
-
-User-agent: Bytespider
-Disallow: /
-
-User-agent: Meta-ExternalAgent
-Disallow: /
-
-User-agent: Applebot-Extended
-Disallow: /
-
-User-agent: cohere-ai
-Disallow: /
-
-User-agent: Diffbot
-Disallow: /
-
-User-agent: *
-Allow: /
-"""
-
-    block_all = """# Block all major AI crawlers (no training, no AI search visibility)
-# Warning: this removes the site from ChatGPT Search, Perplexity, Claude search, etc.
-
-User-agent: GPTBot
-Disallow: /
-
-User-agent: OAI-SearchBot
-Disallow: /
-
-User-agent: ChatGPT-User
-Disallow: /
-
-User-agent: ClaudeBot
-Disallow: /
-
-User-agent: Claude-SearchBot
-Disallow: /
-
-User-agent: Claude-User
-Disallow: /
-
-User-agent: anthropic-ai
-Disallow: /
-
-User-agent: PerplexityBot
-Disallow: /
-
-User-agent: Perplexity-User
-Disallow: /
-
-User-agent: Google-Extended
-Disallow: /
-
-# Note: GoogleOther is Google's general R&D crawler, not purely AI training.
-# Blocking it is not a clean training opt-out (Google-Extended is) and may
-# affect other Google product functions.
-User-agent: GoogleOther
-Disallow: /
-
-User-agent: Meta-ExternalAgent
-Disallow: /
-
-User-agent: FacebookBot
-Disallow: /
-
-User-agent: Applebot-Extended
-Disallow: /
-
-User-agent: CCBot
-Disallow: /
-
-User-agent: Bytespider
-Disallow: /
-
-User-agent: Amazonbot
-Disallow: /
-
-User-agent: cohere-ai
-Disallow: /
-
-User-agent: Diffbot
-Disallow: /
-
-User-agent: YouBot
-Disallow: /
-
-User-agent: *
-Allow: /
-"""
+    # Keep templates in sync with the same catalog used by the report. Do not
+    # include a wildcard group: that could overwrite unrelated crawler policy.
+    def template(mode):
+        lines = [
+            "# Rules for the crawler tokens checked by AI Bot Blocker Checker.",
+            "# Review and merge with existing groups; do not replace unrelated rules.",
+            "# robots.txt is advisory and does not guarantee access or exclusion.",
+        ]
+        for bot in AI_BOTS:
+            block = mode == "block" or (mode == "balanced" and bot["category"] == "Training")
+            directive = "Disallow" if block else "Allow"
+            lines.extend(["", f"User-agent: {bot['ua']}", f"{directive}: /"])
+        return "\n".join(lines)
 
     return [
         {
-            "title": "1. Allow all major AI bots (recommended for visibility)",
-            "description": "Best default if your content markets a product or company (B2B, SaaS, portfolios): being cited in ChatGPT, Claude, Perplexity and Gemini answers is free distribution. Explicit Allow rules make intent clear.",
+            "title": "1. Allow the listed crawlers",
+            "description": "Permit the listed crawler tokens in robots.txt. Access, indexing, and citations still depend on the operator and other site controls.",
             "audience": "vendor",
-            "snippet": allow_all.strip()
+            "snippet": template("allow"),
         },
         {
-            "title": "2. Balanced: allow search/citations, block pure training",
-            "description": "For publishers whose content IS the product (news, original reporting, paid content). Keeps you visible in AI answers while opting out of model-training crawls. If your site is marketing for something else you sell, this template costs you reach for little benefit.",
+            "title": "2. Allow search and user fetch; restrict the training category",
+            "description": "Disallow tokens categorized as Training and allow the listed search and user-fetch tokens. Categories are a guide: some tokens control several uses or represent legacy crawlers.",
             "audience": "publisher",
-            "snippet": balanced.strip()
+            "snippet": template("balanced"),
         },
         {
-            "title": "3. Block everything AI-related",
-            "description": "Use only if you want zero AI use of your content. This will also hide the site from AI search features and most citation surfaces.",
+            "title": "3. Disallow the listed crawlers",
+            "description": "Request that every listed crawler token avoid the site. This is not access control, a guarantee of removal, or a complete list of AI crawlers.",
             "audience": "strict",
-            "snippet": block_all.strip()
+            "snippet": template("block"),
         },
     ]
 
@@ -469,21 +296,21 @@ def compute_posture(bots_result: list) -> dict:
     if not blocked:
         return {
             "verdict": "open",
-            "label": "Fully open",
-            "detail": "No AI crawlers are blocked by robots.txt. The site is available for both training and AI search/citation.",
+            "label": "Root path allowed",
+            "detail": "The root path is allowed for every listed crawler token by the inspected robots.txt rules. This does not establish actual access, indexing, or use.",
         }
     if len(blocked) == len(bots_result):
         return {
             "verdict": "locked_down",
-            "label": "Locked down",
-            "detail": "Every AI crawler checked is blocked. The site will not appear in AI search results or citations, and its content is opted out of training.",
+            "label": "Root path disallowed",
+            "detail": "The root path is disallowed for every listed crawler token. robots.txt is advisory and does not guarantee exclusion from search, citations, or training.",
         }
     if len(s_blocked) >= 3 or (search and len(s_blocked) * 2 >= len(search)):
         names = ", ".join(b["name"] for b in s_blocked[:3])
         return {
             "verdict": "visibility_risk",
             "label": "Visibility risk",
-            "detail": f"{len(s_blocked)} of {len(search)} search/retrieval bots are blocked (including {names}). This can remove the site from ChatGPT Search, Perplexity, Claude search results, and similar citation surfaces.",
+            "detail": f"{len(s_blocked)} of {len(search)} search/retrieval bots are blocked (including {names}). These published root-path restrictions may limit crawling; they do not establish whether the site appears in search results or citations.",
         }
     if t_blocked and t_allowed:
         blocked_ops = operators(t_blocked)
@@ -491,25 +318,24 @@ def compute_posture(bots_result: list) -> dict:
         allowed_phrase = ", ".join(allowed_ops) if allowed_ops else "other crawlers from those same operators"
         return {
             "verdict": "selective",
-            "label": "Selective training block — likely unintentional",
+            "label": "Selective training-category rules",
             "detail": (
                 f"Blocks training crawlers from {', '.join(blocked_ops)} "
                 f"but still allows {allowed_phrase} "
                 f"({len(t_blocked)} of {len(training)} training bots blocked). "
-                "This usually means a partially copied blocklist rather than a deliberate policy — "
-                "use the Balanced template below to close the gaps, or the Allow-all template if training access is fine."
+                "Review whether this matches your intended policy before changing rules."
             ),
         }
     if training and not t_allowed and not s_blocked:
         return {
             "verdict": "balanced",
             "label": "Balanced posture",
-            "detail": f"All {len(training)} training bots are blocked while search/retrieval bots remain allowed. This is a common configuration for publishers who want citations without training access.",
+            "detail": f"All {len(training)} tokens in the Training category are disallowed at the root path while the listed search tokens remain allowed. Actual crawler behavior can differ.",
         }
     return {
         "verdict": "mixed",
         "label": "Mixed rules",
-        "detail": "Some AI bots are blocked in a pattern that doesn't match a common posture. Review the categories below and use the recommendations to fine-tune.",
+        "detail": "The listed crawler tokens have mixed root-path rules. Review the categories below against your intended policy.",
     }
 
 
